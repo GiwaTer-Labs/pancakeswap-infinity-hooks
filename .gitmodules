@@ -1,0 +1,15 @@
+[submodule "lib/forge-std"]
+	path = lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
+[submodule "lib/infinity-core"]
+	path = lib/infinity-core
+	url = https://github.com/pancakeswap/infinity-core
+[submodule "lib/infinity-periphery"]
+	path = lib/infinity-periphery
+	url = https://github.com/pancakeswap/infinity-periphery
+[submodule "lib/prb-math"]
+	path = lib/prb-math
+	url = https://github.com/PaulRBerg/prb-math
+[submodule "lib/pancake-create3-factory"]
+	path = lib/pancake-create3-factory
+	url = https://github.com/pancakeswap/pancake-create3-factory

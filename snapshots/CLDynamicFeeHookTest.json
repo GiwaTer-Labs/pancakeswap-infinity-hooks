@@ -1,0 +1,8 @@
+{
+  "CLOracleDynamicFeeHook#swap_no_dynamic_fee_and_no_simulation_swap": "195898",
+  "CLOracleDynamicFeeHook#swap_with_dynamic_fee_oneForZero": "333791",
+  "CLOracleDynamicFeeHook#swap_with_dynamic_fee_zeroForOne": "345207",
+  "swap_no_dynamic_fee_and_no_simulation_swap": "242854",
+  "swap_with_dynamic_fee_oneForZero": "297620",
+  "swap_with_dynamic_fee_zeroForOne": "298183"
+}

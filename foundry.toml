@@ -1,0 +1,21 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.26"
+optimizer_runs = 1000
+via_ir = true
+evm_version = "cancun"
+ffi = true
+gas_limit = "3000000000"
+fs_permissions = [
+    { access = "read-write", path = ".forge-snapshots/" },
+    { access = "read", path = "./script/config" },
+    { access = "read", path = "./test/pool-cl/dynamic-fee/test" },
+]
+
+[profile.default.fuzz]
+runs = 256
+
+[profile.ci.fuzz]
+runs = 1000
