@@ -3,7 +3,8 @@
 All Solidity hooks found in the full history of
 [`pancakeswap/infinity-hooks`](https://github.com/pancakeswap/infinity-hooks) and
 [`pancakeswap/infinity-dynamic-fee-hook`](https://github.com/pancakeswap/infinity-dynamic-fee-hook)
-(all branches, open and closed PRs), ported to the latest `infinity-core` / `infinity-periphery`.
+(all branches, open and closed PRs), plus the Shared Inventory Hook verified on BscScan, ported to the latest
+`infinity-core` / `infinity-periphery`.
 
 ## Quick Start
 
@@ -31,10 +32,20 @@ forge test --isolate   # --isolate: see infinity-core#35
 | CLProxyHook | `src/pool-cl/proxy` | infinity-hooks `feat/proxy-hook` (PR #7) | open, WIP, no tests |
 | CLDynamicFeeHook (ewVWAP) | `src/pool-cl/dynamic-fee/CLDynamicFeeHook.sol` | infinity-dynamic-fee-hook `master` | merged, deployed |
 | CLOracleDynamicFeeHook | `src/pool-cl/dynamic-fee-oracle` | infinity-dynamic-fee-hook `feat/formula-without-oracle` (PR #5) | closed |
+| CLSharedInventoryHook | `src/pool-cl/shared-inventory` | BscScan-verified [`0x56a7…82c0`](https://bscscan.com/address/0x56a78328A880c6D2b28482D9c481C0061C3D82c0#code) (BSC) | deployed, source not on GitHub |
 | CLOracleAfterSwapDynamicFeeHook | `src/pool-cl/dynamic-fee-oracle-afterswap` | infinity-dynamic-fee-hook `feat/refactor-dynamic-fee-no-simulation` (PR #4) | closed |
 
 The oracle dynamic fee hook from infinity-hooks PR #15/#16 is an earlier snapshot of
 `CLOracleDynamicFeeHook` and is not included separately.
+
+## Shared Inventory Hook provenance
+
+Fetched with `cast source` from BscScan. The five `src/cl` files match the verified sources byte for byte. The
+original build (infinity-core `7c1090e`, solc 0.8.26, via-IR, 1000 runs, cancun) reproduces the deployed runtime
+code exactly; the only differences are immutables (pool manager, vault, permission bitmap) and the CBOR metadata
+hash. In this repo the only change is import paths (`infinity-hooks/src/…` → `src/…`, `@openzeppelin/contracts/…` →
+`openzeppelin-contracts/contracts/…`), and it compiles unchanged against the latest infinity-core.
+`test/pool-cl/CLSharedInventoryHook.t.sol` is a smoke test written here, not upstream.
 
 ## Porting changes
 
