@@ -25,11 +25,11 @@ jobs:
       - name: Show Forge version
         run: forge --version
 
-      - name: Run Forge fmt
-        run: forge fmt --check
+      # No `forge fmt --check`: sources are kept as published upstream (the SIH files match BscScan byte for byte).
 
       - name: Run Forge build
         run: forge build --sizes
 
+      # --isolate: see infinity-core#35
       - name: Run Forge tests
-        run: forge test -vvv
+        run: forge test --isolate -vvv
