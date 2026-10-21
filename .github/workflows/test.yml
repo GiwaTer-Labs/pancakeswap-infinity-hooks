@@ -33,3 +33,9 @@ jobs:
       # --isolate: see infinity-core#35
       - name: Run Forge tests
         run: forge test --isolate -vvv
+
+      # The Shared Inventory Hook tests run on infinity-core 7c1090e, the revision deployed on BSC (lib/infinity-core-bsc).
+      - name: Run Shared Inventory Hook tests (BSC core 7c1090e)
+        run: forge test --isolate -vvv
+        env:
+          FOUNDRY_PROFILE: bsc

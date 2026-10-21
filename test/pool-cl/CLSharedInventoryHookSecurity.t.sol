@@ -37,12 +37,24 @@ contract SecSwapper is ILockCallback {
     }
 
     function swap(PoolKey memory key, bool zeroForOne, int256 amountSpecified) external returns (BalanceDelta) {
-        return abi.decode(vault.lock(abi.encode(key, zeroForOne, amountSpecified, msg.sender)), (BalanceDelta));
+        return abi.decode(vault.lock(abi.encode(uint8(0), key, zeroForOne, amountSpecified, msg.sender)), (BalanceDelta));
+    }
+
+    /// @dev Full-range liquidity on a (hookless) pool, paid by the caller.
+    function addLiquidity(PoolKey memory key, int256 liquidity) external {
+        vault.lock(abi.encode(uint8(1), key, false, liquidity, msg.sender));
     }
 
     function lockAcquired(bytes calldata data) external returns (bytes memory) {
         require(msg.sender == address(vault), "not vault");
-        (PoolKey memory key, bool z, int256 amt, address payer) = abi.decode(data, (PoolKey, bool, int256, address));
+        (uint8 op, PoolKey memory key, bool z, int256 amt, address payer) =
+            abi.decode(data, (uint8, PoolKey, bool, int256, address));
+        if (op == 1) {
+            (BalanceDelta l,) = pm.modifyLiquidity(key, ICLPoolManager.ModifyLiquidityParams(-887270, 887270, amt, 0), "");
+            _resolve(key.currency0, l.amount0(), payer);
+            _resolve(key.currency1, l.amount1(), payer);
+            return "";
+        }
         BalanceDelta d = pm.swap(
             key,
             ICLPoolManager.SwapParams({
@@ -125,11 +137,14 @@ contract Phisher {
     }
 }
 
-/// @notice Adversarial / invariant suite for CLSharedInventoryHook on the pinned infinity-core.
-/// @dev Pools: P1 (A,B), P2 (A,C), P3 (B,C) — A is shared by P1 and P2, every token by two pools. No pool has
-///      resident liquidity; every swap is filled by the hook's JIT position only. The vault is pre-seeded with a
-///      plain token transfer of each token so the hook's in-afterSwap `take` is backed by physical balance (on a
-///      live chain other pools' reserves play that role).
+/// @notice Adversarial / invariant suite for CLSharedInventoryHook on infinity-core 7c1090e (the BSC deployment).
+/// @dev Pools: P1 (A,B), P2 (A,C), P3 (B,C) — A is shared by P1 and P2, every token by two pools. No hook pool has
+///      resident liquidity; every swap is filled by the hook's JIT position only.
+///      On 7c1090e the afterSwap removal underflows (and the hook defers it) only when the swap's input exceeds the
+///      pool manager's CL-wide `reservesOfApp` of that token. Two kinds of token model the two paths BSC pools take:
+///      - A, B, C are "mainstream": hookless full-range pools hold ~1e27 of each (as USDT/WBNB/CAKE do on BSC),
+///        so every hook swap removes inline.
+///      - D is "long-tail": no other CL liquidity, so selling D into PD (D,A) defers; selling A into PD is inline.
 contract CLSharedInventoryHookSecurityTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
     using CLPoolParametersHelper for bytes32;
@@ -148,9 +163,11 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
     MockERC20 tA;
     MockERC20 tB;
     MockERC20 tC;
+    MockERC20 tD;
     PoolKey p1;
     PoolKey p2;
     PoolKey p3;
+    PoolKey pD;
 
     address CREATOR = makeAddr("creator");
     address TREASURY = makeAddr("treasury");
@@ -161,9 +178,11 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
         hook = new CLSharedInventoryHook(poolManager, address(this));
         swapper = new SecSwapper(vault, poolManager, address(hook));
 
-        MockERC20[] memory ts = deployTokens(3, type(uint256).max);
-        (tA, tB, tC) = (ts[0], ts[1], ts[2]);
-        for (uint256 i; i < 3; i++) _fund(ts[i]);
+        MockERC20[] memory ts = deployTokens(4, type(uint256).max);
+        (tA, tB, tC, tD) = (ts[0], ts[1], ts[2], ts[3]);
+        for (uint256 i; i < 4; i++) _fund(ts[i]);
+        _seedReserve(tA, tB);
+        _seedReserve(tB, tC);
 
         address[] memory who = new address[](1);
         bool[] memory yes = new bool[](1);
@@ -176,6 +195,7 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
         p1 = _createPool(tA, tB, 2500, L);
         p2 = _createPool(tA, tC, 2500, L);
         p3 = _createPool(tB, tC, 2500, L);
+        pD = _createPool(tD, tA, 2500, L);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -185,7 +205,14 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
     function _fund(MockERC20 t) internal {
         t.approve(address(swapper), type(uint256).max);
         t.transfer(address(hook), INVENTORY);
-        t.transfer(address(vault), 1e27);
+    }
+
+    /// @dev A hookless full-range (a,b) pool holding ~1e27 of each: CL-wide reserve, as other pools provide on BSC.
+    function _seedReserve(MockERC20 a, MockERC20 b) internal {
+        (Currency c0, Currency c1) = SortTokens.sort(a, b);
+        PoolKey memory k = PoolKey(c0, c1, IHooks(address(0)), poolManager, 500, bytes32(0).setTickSpacing(10));
+        poolManager.initialize(k, SQRT_RATIO_1_1);
+        swapper.addLiquidity(k, 1e27);
     }
 
     function _cfg(int24 lo, int24 hi, uint128 liq) internal pure returns (ICLSharedInventoryHook.PoolConfig memory) {
@@ -248,33 +275,15 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
         return c.liquidity;
     }
 
-    function _removalCall(PoolKey memory k, ICLSharedInventoryHook.PoolConfig memory c)
-        internal
-        pure
-        returns (bytes memory)
-    {
-        return abi.encodeCall(
-            ICLPoolManager.modifyLiquidity,
-            (
-                k,
-                ICLPoolManager.ModifyLiquidityParams({
-                    tickLower: c.tickLower,
-                    tickUpper: c.tickUpper,
-                    liquidityDelta: -int256(uint256(c.liquidity)),
-                    salt: SALT
-                }),
-                ""
-            )
-        );
+    /// @dev Sell `amount` of long-tail D into PD. D has no CL reserve outside PD, so the afterSwap removal underflows
+    ///      `reservesOfApp` and the hook takes its real catch branch (no mock).
+    function _deferredSwap(int256 amount) internal returns (BalanceDelta d) {
+        d = _swap(pD, _dIs0(), -amount);
+        assertEq(_pendingL(), L, "long-tail input did not defer");
     }
 
-    /// @dev Drive the REAL catch branch of afterSwap: make exactly the removal call revert (the injection call has
-    ///      different calldata and is untouched), swap, then lift the mock. On the pinned core nothing else reaches
-    ///      that branch (see the gas-griefing test), so this only substitutes the cause, not the handling.
-    function _forceDeferredSwap(PoolKey memory k, bool zeroForOne, int256 amount) internal returns (BalanceDelta d) {
-        vm.mockCallRevert(address(poolManager), _removalCall(k, hook.getPoolConfig(k.toId())), "forced");
-        d = _swap(k, zeroForOne, amount);
-        vm.clearMockedCalls();
+    function _dIs0() internal view returns (bool) {
+        return Currency.unwrap(pD.currency0) == address(tD);
     }
 
     function _contains(bytes memory hay, bytes4 sel) internal pure returns (bool) {
@@ -391,9 +400,9 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
         (ok,) = address(swapper).call{gas: g}(abi.encodeCall(SecSwapper.swap, (p1, true, -int256(5e18))));
     }
 
-    /// Sweep the outer gas limit across the whole success boundary. If a limit existed where modifyLiquidity(-L)
-    /// OOGs but the catch still completes, some limit would succeed WITH a pending record. None does: the catch
-    /// arm (settle 2 legs + 3 SSTOREs + event) needs far more than 1/64 of what the removal needs.
+    /// Mainstream pool (inline path). Sweep the outer gas limit across the whole success boundary. If a limit existed
+    /// where modifyLiquidity(-L) OOGs but the catch still completes, some limit would succeed WITH a pending record.
+    /// None does: the catch arm (settle 2 legs + 3 SSTOREs + event) needs far more than 1/64 of what the removal needs.
     function test_gasGriefing_cannotForceDeferral() public {
         uint256 lo = 50_000;
         uint256 hi = 5_000_000;
@@ -423,42 +432,44 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
         assertGt(successes, 0);
     }
 
-    /// If the catch is reached while deferral is disabled, the whole swap reverts — nothing is parked or paid.
+    /// A long-tail swap that would defer reverts as a whole while deferral is disabled — nothing is parked or paid.
     function test_disableDeferredRemoval_catchRevertsWholeSwap() public {
         hook.setDisableDeferredRemoval(true);
-        uint256 a0 = _bal(p1.currency0);
-        vm.mockCallRevert(address(poolManager), _removalCall(p1, hook.getPoolConfig(p1.toId())), "forced");
-        vm.expectRevert();
-        _swap(p1, true, -5e18);
-        vm.clearMockedCalls();
+        uint256 d0 = _bal(Currency.wrap(address(tD)));
+        try swapper.swap(pD, _dIs0(), -5e18) {
+            fail();
+        } catch (bytes memory err) {
+            assertTrue(_contains(err, ICLSharedInventoryHook.RemovalDeferralDisabled.selector), "not RemovalDeferralDisabled");
+        }
         assertEq(_pendingL(), 0);
-        assertEq(_bal(p1.currency0), a0);
-        assertEq(_posL(p1, LOWER, UPPER), 0);
+        assertEq(_bal(Currency.wrap(address(tD))), d0);
+        assertEq(_posL(pD, LOWER, UPPER), 0);
+        _swap(pD, !_dIs0(), -5e18); // the mainstream-input direction still removes inline
     }
 
-    /// Economics of a deferral if one were forced: the hook pays the full principal now, the position stays parked
-    /// at the swap's ending price, and the next swap on ANY pool returns it with the trade + fee. No value lost.
+    /// Economics of a real deferral: the hook pays the full principal now, the position stays parked at the swap's
+    /// ending price, and the next swap on ANY pool returns it with the trade + fee. No value lost.
     function test_deferral_paysFullPrincipal_thenNextSwapAnywhereRestores() public {
-        uint256 a = _bal(p1.currency0);
-        uint256 b = _bal(p1.currency1);
+        uint256 a = _bal(pD.currency0);
+        uint256 b = _bal(pD.currency1);
         vm.expectEmit(true, false, false, false, address(hook));
-        emit ICLSharedInventoryHook.JitRemovalDeferred(p1.toId());
-        _forceDeferredSwap(p1, true, -5e18);
+        emit ICLSharedInventoryHook.JitRemovalDeferred(pD.toId());
+        _deferredSwap(5e18);
 
         (uint256 req0, uint256 req1) = hook.requiredInventory(_cfg(LOWER, UPPER, L), SQRT_RATIO_1_1);
-        assertApproxEqAbs(a - _bal(p1.currency0), req0, 2, "paid full token0 principal");
-        assertApproxEqAbs(b - _bal(p1.currency1), req1, 2, "paid full token1 principal");
-        assertEq(_posL(p1, LOWER, UPPER), L, "position parked");
+        assertApproxEqAbs(a - _bal(pD.currency0), req0, 2, "paid full token0 principal");
+        assertApproxEqAbs(b - _bal(pD.currency1), req1, 2, "paid full token1 principal");
+        assertEq(_posL(pD, LOWER, UPPER), L, "position parked");
         (PoolId pid,) = hook.pendingRemoval();
-        assertEq(PoolId.unwrap(pid), PoolId.unwrap(p1.toId()));
+        assertEq(PoolId.unwrap(pid), PoolId.unwrap(pD.toId()));
 
-        // a swap on P3 (no token in common with P1's leg A) flushes P1's position
+        // a swap on P3 (no token in common with PD) flushes PD's position
         vm.expectEmit(true, false, false, false, address(hook));
-        emit ICLSharedInventoryHook.FeesEarned(p1.toId(), 0, 0);
+        emit ICLSharedInventoryHook.FeesEarned(pD.toId(), 0, 0);
         _swap(p3, true, -1e18);
         assertEq(_pendingL(), 0, "flushed");
-        assertEq(_posL(p1, LOWER, UPPER), 0);
-        assertGt(_bal(p1.currency0) + _bal(p1.currency1) + 1e18, a + b, "value restored");
+        assertEq(_posL(pD, LOWER, UPPER), 0);
+        assertGt(_bal(pD.currency0) + _bal(pD.currency1) + 1e18, a + b, "value restored");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -470,8 +481,9 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
         f.mint(address(this), 1e30);
         _fund(MockERC20(address(f)));
         PoolKey memory pf = _createPool(MockERC20(address(f)), tA, 2500, L);
+        bool sellF = Currency.unwrap(pf.currency0) == address(f);
 
-        _forceDeferredSwap(pf, true, -5e18);
+        _swap(pf, sellF, -5e18); // f is long-tail (no CL reserve elsewhere): the removal defers
         assertEq(_pendingL(), L);
         f.setFrozen(true);
 
@@ -495,7 +507,7 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
         _swap(p3, true, -1e18);
         _swap(p2, false, -1e18);
         vm.expectRevert(); // pf itself still moves the frozen token
-        _swap(pf, true, -1e18);
+        _swap(pf, sellF, -1e18);
 
         // after unfreezing, the parked position is fully reclaimed
         f.setFrozen(false);
@@ -650,6 +662,7 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
         evil = new ReentrantToken();
         evil.mint(address(this), 1e30);
         _fund(MockERC20(address(evil)));
+        _seedReserve(evil, tA); // inline path: the vault pays the hook inside afterSwap
         k = _createPool(MockERC20(address(evil)), tA, 2500, L);
         sellEvil = Currency.unwrap(k.currency0) == address(evil); // zeroForOne sells evil
     }
@@ -786,54 +799,56 @@ contract CLSharedInventoryHookSecurityTest is Test, Deployers {
                   10. CONFIG CHANGE WITH A PENDING REMOVAL
     //////////////////////////////////////////////////////////////*/
 
-    /// Owner re-ranges P1 while P1's deferred position is parked. The flush burns the OLD (snapshotted) position
-    /// exactly; the next P1 swap uses the new config; nothing is stranded.
+    /// Owner re-ranges PD while PD's deferred position is parked. The flush burns the OLD (snapshotted) position
+    /// exactly; the next PD swap uses the new config; nothing is stranded.
     function test_configChangeWhilePending_flushUsesSnapshot() public {
-        _forceDeferredSwap(p1, true, -5e18);
-        _setConfig(p1, _cfg(-1200, 1200, L / 2));
+        _deferredSwap(5e18);
+        _setConfig(pD, _cfg(-1200, 1200, L / 2));
         vm.expectRevert(ICLSharedInventoryHook.PendingRemovalOutstanding.selector);
         hook.setDisableDeferredRemoval(true);
 
         _swap(p2, true, -1e18); // flush on another pool
         assertEq(_pendingL(), 0);
-        assertEq(_posL(p1, LOWER, UPPER), 0, "old position burned");
+        assertEq(_posL(pD, LOWER, UPPER), 0, "old position burned");
 
-        _swap(p1, false, -1e18);
-        assertEq(_posL(p1, -1200, 1200), 0, "new position removed inline");
-        assertEq(_posL(p1, LOWER, UPPER), 0);
+        _swap(pD, !_dIs0(), -1e18); // sell mainstream A: removed inline
+        assertEq(_pendingL(), 0);
+        assertEq(_posL(pD, -1200, 1200), 0, "new position removed inline");
+        assertEq(_posL(pD, LOWER, UPPER), 0);
     }
 
     /// Disabling the pool or pausing JIT does not stop the flush.
     function test_disableAndJitPauseWhilePending_stillFlushes() public {
-        _forceDeferredSwap(p1, true, -5e18);
+        _deferredSwap(5e18);
         ICLSharedInventoryHook.PoolConfig memory off;
-        _setConfig(p1, off);
+        _setConfig(pD, off);
         hook.setJitPaused(true);
-        _swap(p1, false, -1); // no JIT and no resident liquidity: fills nothing, but flushes
+        _swap(pD, !_dIs0(), -1); // no JIT and no resident liquidity: fills nothing, but flushes
         assertEq(_pendingL(), 0);
-        assertEq(_posL(p1, LOWER, UPPER), 0);
+        assertEq(_posL(pD, LOWER, UPPER), 0);
     }
 
     /// emergencyRemoveLiquidity for the pending pool clears the WHOLE record even when it burns only part of the
     /// position: the remainder is no longer tracked, is never flushed, and sits as hook-owned resident liquidity
     /// until the owner removes it by hand.
     function test_partialEmergencyRemove_dropsWholeRecord_remainderUntracked() public {
-        _forceDeferredSwap(p1, true, -5e18);
-        hook.emergencyRemoveLiquidity(p1, LOWER, UPPER, L / 2, 0, 0);
+        _deferredSwap(5e18);
+        hook.emergencyRemoveLiquidity(pD, LOWER, UPPER, L / 2, 0, 0);
         assertEq(_pendingL(), 0, "record dropped");
-        assertEq(_posL(p1, LOWER, UPPER), L / 2, "half still live");
+        assertEq(_posL(pD, LOWER, UPPER), L / 2, "half still live");
 
         _swap(p2, true, -1e18);
-        _swap(p1, false, -1e18); // injects L on top, removes L: the untracked half survives every swap
-        assertEq(_posL(p1, LOWER, UPPER), L / 2, "remainder never flushed");
+        _swap(pD, !_dIs0(), -1e18); // inline: injects L on top, removes L; the untracked half survives every swap
+        assertEq(_pendingL(), 0);
+        assertEq(_posL(pD, LOWER, UPPER), L / 2, "remainder never flushed");
 
-        hook.emergencyRemoveLiquidity(p1, LOWER, UPPER, L / 2, 0, 0);
-        assertEq(_posL(p1, LOWER, UPPER), 0, "manual recovery works");
+        hook.emergencyRemoveLiquidity(pD, LOWER, UPPER, L / 2, 0, 0);
+        assertEq(_posL(pD, LOWER, UPPER), 0, "manual recovery works");
     }
 
     /// An emergency removal on a DIFFERENT pool leaves the pending record alone.
     function test_emergencyRemoveOtherPool_keepsPending() public {
-        _forceDeferredSwap(p1, true, -5e18);
+        _deferredSwap(5e18);
         hook.emergencyRemoveLiquidity(p2, LOWER, UPPER, 0, 0, 0);
         assertEq(_pendingL(), L);
     }

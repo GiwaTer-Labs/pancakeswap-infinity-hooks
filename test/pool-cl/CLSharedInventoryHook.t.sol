@@ -20,10 +20,10 @@ import {MockCLSwapRouter} from "./helpers/MockCLSwapRouter.sol";
 import {CLSharedInventoryHook} from "../../src/pool-cl/shared-inventory/CLSharedInventoryHook.sol";
 import {ICLSharedInventoryHook} from "../../src/pool-cl/shared-inventory/interfaces/ICLSharedInventoryHook.sol";
 
-/// @notice Smoke test: the verified BSC SharedInventoryHook still runs its JIT swap lifecycle on the latest
-///         infinity-core. The hooked pool has no resident liquidity, so every swap is filled from hook inventory only.
-///         A separate hookless pool on the same tokens seeds the vault's balances, as other pools do on mainnet: the
-///         hook takes its JIT proceeds in afterSwap, before the swapper's input has been settled.
+/// @notice Smoke test: the verified BSC SharedInventoryHook runs its JIT swap lifecycle on infinity-core 7c1090e,
+///         the revision deployed on BSC (run with FOUNDRY_PROFILE=bsc). The hooked pool has no resident liquidity, so every swap is filled from hook inventory only.
+///         A separate hookless pool on the same tokens gives the pool manager a CL-wide reserve of both tokens, as
+///         other pools do on BSC, so the afterSwap removal settles inline instead of deferring.
 contract CLSharedInventoryHookTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
     using CLPoolParametersHelper for bytes32;

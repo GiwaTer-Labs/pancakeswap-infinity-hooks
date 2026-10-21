@@ -23,7 +23,7 @@ import {CLSharedInventoryHook} from "../../src/pool-cl/shared-inventory/CLShared
 import {ICLSharedInventoryHook} from "../../src/pool-cl/shared-inventory/interfaces/ICLSharedInventoryHook.sol";
 
 /// @dev Trader that holds its own funds. Settles any ERC20 (grossing up for fee-on-transfer and taking back any
-///      overpayment) or native, and can donate to a pool.
+///      overpayment) or native, can donate to a pool, and can add full-range liquidity to a (hookless) pool.
 contract AccSwapper is ILockCallback {
     IVault public immutable vault;
     ICLPoolManager public immutable pm;
@@ -44,12 +44,18 @@ contract AccSwapper is ILockCallback {
         vault.lock(abi.encode(uint8(1), key, a0 != 0, int256(a0 + a1), uint160(0)));
     }
 
+    function addLiquidity(PoolKey memory key, int256 liquidity) external {
+        vault.lock(abi.encode(uint8(2), key, false, liquidity, uint160(0)));
+    }
+
     function lockAcquired(bytes calldata data) external returns (bytes memory) {
         (uint8 op, PoolKey memory key, bool z, int256 amt, uint160 limit) =
             abi.decode(data, (uint8, PoolKey, bool, int256, uint160));
         BalanceDelta d;
         if (op == 0) {
             d = pm.swap(key, ICLPoolManager.SwapParams({zeroForOne: z, amountSpecified: amt, sqrtPriceLimitX96: limit}), "");
+        } else if (op == 2) {
+            (d,) = pm.modifyLiquidity(key, ICLPoolManager.ModifyLiquidityParams(-887270, 887270, amt, 0), "");
         } else {
             d = pm.donate(key, z ? uint256(amt) : 0, z ? 0 : uint256(amt), "");
         }
@@ -102,9 +108,12 @@ contract FeeOnTransferToken is MockERC20 {
     }
 }
 
-/// @notice Accounting PoCs: where the hook's books (its live balance) and economic reality diverge, and who gains.
-/// @dev Pools P1 (A,B) and P2 (A,C) share A. No resident liquidity: every swap is filled by the JIT position only.
-///      The vault is pre-funded so the hook's in-afterSwap `take` is backed (other pools play that role on chain).
+/// @notice Accounting PoCs on infinity-core 7c1090e (the BSC deployment): where the hook's books (its live balance)
+///         and economic reality diverge, and who gains.
+/// @dev Pools P1 (A,B) and P2 (A,C) share A. No resident liquidity in hook pools: every swap is filled by the JIT
+///      position only. A, B, C are "mainstream": hookless full-range pools give them a large CL-wide `reservesOfApp`
+///      (as USDT/WBNB/CAKE have on BSC), so their swaps remove inline. A "long-tail" token with no other CL
+///      liquidity ({_longTailPool}) makes swaps that sell it defer.
 contract CLSharedInventoryHookAccountingTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
     using CLPoolParametersHelper for bytes32;
@@ -139,6 +148,8 @@ contract CLSharedInventoryHookAccountingTest is Test, Deployers {
         MockERC20[] memory ts = deployTokens(3, type(uint256).max);
         (tA, tB, tC) = (ts[0], ts[1], ts[2]);
         for (uint256 i; i < 3; i++) _fund(ts[i]);
+        _seedReserve(Currency.wrap(address(tA)), Currency.wrap(address(tB)), SQRT_RATIO_1_1, 1e27);
+        _seedReserve(Currency.wrap(address(tA)), Currency.wrap(address(tC)), SQRT_RATIO_1_1, 1e27);
 
         address[] memory who = new address[](1);
         bool[] memory yes = new bool[](1);
@@ -155,8 +166,24 @@ contract CLSharedInventoryHookAccountingTest is Test, Deployers {
 
     function _fund(MockERC20 t) internal {
         t.transfer(address(hook), INVENTORY);
-        t.transfer(address(vault), 1e27);
-        t.transfer(address(trader), 1e27);
+        t.transfer(address(trader), 1e28);
+    }
+
+    /// @dev Hookless full-range pool (a,b) at `price` with liquidity `liq`: CL-wide reserve, as other pools give on BSC.
+    function _seedReserve(Currency a, Currency b, uint160 price, uint128 liq) internal {
+        (Currency c0, Currency c1) = Currency.unwrap(a) < Currency.unwrap(b) ? (a, b) : (b, a);
+        PoolKey memory k = PoolKey(c0, c1, IHooks(address(0)), poolManager, 500, bytes32(0).setTickSpacing(10));
+        poolManager.initialize(k, price);
+        trader.addLiquidity(k, int256(uint256(liq)));
+    }
+
+    /// @dev Hook pool (D, B) where D is a fresh long-tail token: no CL liquidity anywhere else, so selling D defers.
+    function _longTailPool() internal returns (PoolKey memory pD, bool dIs0) {
+        MockERC20 d = new MockERC20("LT", "LT", 18);
+        d.mint(address(hook), INVENTORY);
+        d.mint(address(trader), 1e27);
+        pD = _createPool(Currency.wrap(address(d)), Currency.wrap(address(tB)), 2500, _cfg(LOWER, UPPER, L), SQRT_RATIO_1_1);
+        dIs0 = Currency.unwrap(pD.currency0) == address(d);
     }
 
     function _cfg(int24 lo, int24 hi, uint128 liq) internal pure returns (ICLSharedInventoryHook.PoolConfig memory) {
@@ -210,30 +237,6 @@ contract CLSharedInventoryHookAccountingTest is Test, Deployers {
     function _pendingL() internal view returns (uint128) {
         (, ICLSharedInventoryHook.PoolConfig memory c) = hook.pendingRemoval();
         return c.liquidity;
-    }
-
-    /// @dev Drive the real catch branch of afterSwap (nothing reaches it naturally on the pinned core).
-    function _forceDeferredSwap(PoolKey memory k, bool zeroForOne, int256 amount) internal {
-        ICLSharedInventoryHook.PoolConfig memory c = hook.getPoolConfig(k.toId());
-        vm.mockCallRevert(
-            address(poolManager),
-            abi.encodeCall(
-                ICLPoolManager.modifyLiquidity,
-                (
-                    k,
-                    ICLPoolManager.ModifyLiquidityParams({
-                        tickLower: c.tickLower,
-                        tickUpper: c.tickUpper,
-                        liquidityDelta: -int256(uint256(c.liquidity)),
-                        salt: SALT
-                    }),
-                    ""
-                )
-            ),
-            "forced"
-        );
-        _swap(k, zeroForOne, amount);
-        vm.clearMockedCalls();
     }
 
     function _one(Currency c) internal pure returns (Currency[] memory a) {
@@ -432,8 +435,8 @@ contract CLSharedInventoryHookAccountingTest is Test, Deployers {
     function test_Q3_nativePool_conserves() public {
         (bool ok,) = address(hook).call{value: 1_000 ether}("");
         assertTrue(ok);
-        vm.deal(address(vault), 1e27);
-        vm.deal(address(trader), 1e27);
+        vm.deal(address(trader), 1e28);
+        _seedReserve(CurrencyLibrary.NATIVE, Currency.wrap(address(tB)), SQRT_RATIO_1_1, 1e27);
         PoolKey memory pn =
             _createPool(CurrencyLibrary.NATIVE, Currency.wrap(address(tB)), 2500, _cfg(LOWER, UPPER, L), SQRT_RATIO_1_1);
         for (uint256 i; i < 4; i++) {
@@ -450,14 +453,14 @@ contract CLSharedInventoryHookAccountingTest is Test, Deployers {
                     Q4. FEE-ON-TRANSFER / DECIMALS
     //////////////////////////////////////////////////////////////*/
 
-    /// FoT: when the hook RECEIVES the token (trader sells it), the vault's take sends `x` and the hook gets 0.99x —
-    /// a silent 1% loss per inflow. When the hook must PAY it (trader buys it), `settle` credits only 0.99x, the
-    /// hook's vault delta stays open and the whole swap reverts: one direction of the pool is bricked.
+    /// FoT with a CL-wide reserve (inline path): when the hook RECEIVES the token (trader sells it), the vault's take
+    /// sends `x` and the hook gets 0.99x — a silent 1% loss per inflow. When the hook must PAY it (trader buys it),
+    /// `settle` credits only 0.99x, the hook's vault delta stays open and the whole swap reverts.
     function test_Q4_feeOnTransfer_silentLossOneWay_revertOtherWay() public {
         FeeOnTransferToken f = new FeeOnTransferToken();
         f.mint(address(hook), 1_000e18);
-        f.mint(address(vault), 1e27);
-        f.mint(address(trader), 1e27);
+        f.mint(address(trader), 1e28);
+        _seedReserve(Currency.wrap(address(f)), Currency.wrap(address(tB)), SQRT_RATIO_1_1, 1e26);
         PoolKey memory pf =
             _createPool(Currency.wrap(address(f)), Currency.wrap(address(tB)), 2500, _cfg(LOWER, UPPER, L), SQRT_RATIO_1_1);
         bool fIs0 = Currency.unwrap(pf.currency0) == address(f);
@@ -475,15 +478,41 @@ contract CLSharedInventoryHookAccountingTest is Test, Deployers {
         _swap(pf, !fIs0, -1e18); // trader buys FOT
     }
 
+    /// FoT with no CL-wide reserve (deferring path): selling FOT defers, so the hook pays the injection in FOT and the
+    /// 99% credit leaves its delta open -> CurrencyNotSettled. Buying FOT makes the hook pay FOT at 99%, and the vault,
+    /// holding no other FOT, cannot transfer the trader's output -> revert. Both directions revert; no silent loss.
+    function test_Q4_feeOnTransfer_deferringPool_bothDirectionsRevert() public {
+        FeeOnTransferToken f = new FeeOnTransferToken();
+        f.mint(address(hook), 1_000e18);
+        f.mint(address(trader), 1e27);
+        PoolKey memory pf =
+            _createPool(Currency.wrap(address(f)), Currency.wrap(address(tB)), 2500, _cfg(LOWER, UPPER, L), SQRT_RATIO_1_1);
+        bool fIs0 = Currency.unwrap(pf.currency0) == address(f);
+        uint256 h = _bal(Currency.wrap(address(f)));
+
+        try trader.swap(pf, fIs0, -1e18, 0) { // sell FOT: deferred, hook settles the FOT injection at 99%
+            fail();
+        } catch (bytes memory err) {
+            assertEq(bytes4(err), IVault.CurrencyNotSettled.selector);
+        }
+        try trader.swap(pf, !fIs0, -1e18, 0) { // buy FOT: the vault cannot pay out FOT the hook under-delivered
+            fail();
+        } catch (bytes memory err) {
+            assertTrue(_contains(err, bytes4(keccak256("Panic(uint256)"))), "not the vault's FOT transfer");
+        }
+        assertEq(_bal(Currency.wrap(address(f))), h, "no FOT lost");
+        assertEq(_pendingL(), 0);
+    }
+
     /// 6-decimal token1 at a realistic 18/6 price (tick -276320): settle is in raw units, nothing assumes decimals;
     /// rounding dust stays <= 2 raw units per swap per side (2e-6 of a 6-dec token).
     function test_Q4_Q5_sixDecimals_dustBounded() public {
         MockERC20 usd = new MockERC20("USD", "USD", 6);
         usd.mint(address(hook), 1_000e6);
-        usd.mint(address(vault), 1e24);
         usd.mint(address(trader), 1e24);
         int24 t = -276320;
         uint160 px = TickMath.getSqrtRatioAtTick(t);
+        _seedReserve(Currency.wrap(address(tA)), Currency.wrap(address(usd)), px, 1e18);
         PoolKey memory pu = _createPool(
             Currency.wrap(address(tA)), Currency.wrap(address(usd)), 0, _cfg(t - 600, t + 600, 1e15), px
         );
@@ -516,21 +545,21 @@ contract CLSharedInventoryHookAccountingTest is Test, Deployers {
     /// is fixed. But the position is live in-range liquidity: a third party's `donate` is credited to it, and the
     /// flush hands the donation to the hook.
     function test_Q6_pendingValueFrozen_donationsAccrueToHook() public {
-        bool aIs0 = Currency.unwrap(p1.currency0) == address(tA);
-        _forceDeferredSwap(p1, aIs0, -5e18); // sell A into P1, deferred
-        (uint160 pAfter,,,) = poolManager.getSlot0(p1.toId());
+        (PoolKey memory pD, bool dIs0) = _longTailPool();
+        _swap(pD, dIs0, -5e18); // sell long-tail D into PD: deferred
+        (uint160 pAfter,,,) = poolManager.getSlot0(pD.toId());
         assertEq(_pendingL(), L);
 
         Currency b = Currency.wrap(address(tB));
-        trader.donate(p1, aIs0 ? 0 : 7e18, aIs0 ? 7e18 : 0); // donate 7 B to the parked position
-        (uint160 pNow,,,) = poolManager.getSlot0(p1.toId());
+        trader.donate(pD, dIs0 ? 0 : 7e18, dIs0 ? 7e18 : 0); // donate 7 B to the parked position
+        (uint160 pNow,,,) = poolManager.getSlot0(pD.toId());
         assertEq(pNow, pAfter, "price unchanged while pending");
 
         uint256 bBefore = _bal(b);
-        _swap(p2, true, -1e15); // P2 (no B) flushes P1's position
+        _swap(p2, true, -1e15); // P2 (no B, no D) flushes PD's position
         assertEq(_pendingL(), 0);
         (uint256 r0, uint256 r1) = hook.requiredInventory(_cfg(LOWER, UPPER, L), pAfter);
-        uint256 principalB = (aIs0 ? r1 : r0) - 1;
+        uint256 principalB = (dIs0 ? r1 : r0) - 1;
         uint256 gotB = _bal(b) - bBefore;
         emit log_named_decimal_uint("B returned by flush", gotB, 18);
         emit log_named_decimal_uint("B principal at deferral price", principalB, 18);
@@ -545,23 +574,24 @@ contract CLSharedInventoryHookAccountingTest is Test, Deployers {
     /// pure credit, so draining everything does not break the next swap. Separately: the recipient allowlist and
     /// the floor are set by the same owner, so a compromised owner key empties the hook in one batch.
     function test_Q7_withdrawAllWhilePending_flushStillSettles_allowlistNoDefence() public {
-        bool aIs0 = Currency.unwrap(p1.currency0) == address(tA);
-        Currency a = Currency.wrap(address(tA));
+        (PoolKey memory pD, bool dIs0) = _longTailPool();
+        Currency d = dIs0 ? pD.currency0 : pD.currency1;
         Currency b = Currency.wrap(address(tB));
-        hook.setMinSharedReserve(_one(a), _one(500e18));
-        _forceDeferredSwap(p1, aIs0, -5e18);
+        hook.setMinSharedReserve(_one(b), _one(500e18));
+        _swap(pD, dIs0, -5e18); // sell long-tail D: deferred
+        assertEq(_pendingL(), L);
 
         // "compromised owner": allowlist itself, zero the floor, withdraw everything live
         address[] memory who = new address[](1);
         bool[] memory yes = new bool[](1);
         (who[0], yes[0]) = (ATTACKER, true);
         hook.setWithdrawRecipient(who, yes);
-        hook.setMinSharedReserve(_one(a), _one(0));
+        hook.setMinSharedReserve(_one(b), _one(0));
         Currency[] memory cs = new Currency[](2);
         uint256[] memory amts = new uint256[](2);
-        (cs[0], cs[1], amts[0], amts[1]) = (a, b, _bal(a), _bal(b));
+        (cs[0], cs[1], amts[0], amts[1]) = (d, b, _bal(d), _bal(b));
         hook.withdraw(cs, amts, ATTACKER);
-        assertEq(_bal(a), 0);
+        assertEq(_bal(d), 0);
         assertEq(_bal(b), 0);
 
         // next swap anywhere: the flush (pure take) succeeds and the parked funds come back as inventory
@@ -571,36 +601,33 @@ contract CLSharedInventoryHookAccountingTest is Test, Deployers {
     }
 
     /*//////////////////////////////////////////////////////////////
-          Q9. afterSwap TAKE RUNS BEFORE THE SWAPPER PAYS
+       Q9. WHEN DOES THE REMOVAL DEFER? INPUT vs CL-WIDE RESERVE
     //////////////////////////////////////////////////////////////*/
 
-    /// The hook `take`s its net credit (the swap's input token) inside afterSwap, i.e. before the swapper's own
-    /// settle. `take` is a physical transfer out of the vault, so the vault must already hold that much of the INPUT
-    /// token from someone else. With the vault's physical balance of the input token at 0 the swap reverts; with the
-    /// output token at 0 (input present) it succeeds.
-    function test_Q9_afterSwapTake_needsPhysicalVaultBalanceOfInputToken() public {
-        bool aIs0 = Currency.unwrap(p1.currency0) == address(tA);
-        bytes4 panic = bytes4(keccak256("Panic(uint256)"));
+    /// On 7c1090e the afterSwap burn returns the position's principal plus the swap input, while `reservesOfApp` holds
+    /// the principal (booked at injection) plus every OTHER CL pool's reserve of that token — the input itself is
+    /// booked only after afterSwap. So the burn underflows, and the hook defers, exactly when the input exceeds the
+    /// CL-wide reserve. A long-tail token D with ~10 D of reserve in one hookless pool: selling 5 D removes inline
+    /// (hook takes the input), selling 15 D defers (hook takes nothing in afterSwap and pays the full injection).
+    function test_Q9_removalDefersOnlyWhenInputExceedsClWideReserve() public {
+        (PoolKey memory pD, bool dIs0) = _longTailPool();
+        Currency d = dIs0 ? pD.currency0 : pD.currency1;
+        _seedReserve(d, Currency.wrap(address(tC)), SQRT_RATIO_1_1, 10e18);
+        uint256 reserveD = vault.reservesOfApp(address(poolManager), d);
+        emit log_named_decimal_uint("CL-wide reserve of D", reserveD, 18);
+        assertApproxEqAbs(reserveD, 10e18, 1e6);
 
         uint256 snap = vm.snapshotState();
-        deal(address(tA), address(vault), 0); // input token (trader sells A)
-        try trader.swap(p1, aIs0, -5e18, 0) {
-            fail();
-        } catch (bytes memory err) {
-            assertTrue(_contains(err, panic), "vault transfer of A underflows");
-        }
+        uint256 h = _bal(d);
+        _swap(pD, dIs0, -5e18);
+        assertEq(_pendingL(), 0, "5 D < reserve: inline");
+        assertApproxEqAbs(_bal(d) - h, 5e18, 2, "hook took the input");
         vm.revertToState(snap);
 
-        snap = vm.snapshotState();
-        deal(address(tA), address(vault), 4e18); // less than the 5 A the hook takes
-        vm.expectRevert();
-        trader.swap(p1, aIs0, -5e18, 0);
-        vm.revertToState(snap);
-
-        deal(address(tB), address(vault), 0); // output token absent, input present: fine
-        uint256 aHook = _bal(Currency.wrap(address(tA)));
-        _swap(p1, aIs0, -5e18);
-        assertApproxEqAbs(_bal(Currency.wrap(address(tA))) - aHook, 5e18, 2, "hook took the full input");
+        (uint256 r0, uint256 r1) = hook.requiredInventory(_cfg(LOWER, UPPER, L), SQRT_RATIO_1_1);
+        _swap(pD, dIs0, -15e18);
+        assertEq(_pendingL(), L, "15 D > reserve: deferred");
+        assertApproxEqAbs(h - _bal(d), dIs0 ? r0 : r1, 2, "hook paid the D principal, took no input");
     }
 
     /*//////////////////////////////////////////////////////////////

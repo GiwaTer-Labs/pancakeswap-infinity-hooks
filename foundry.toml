@@ -8,14 +8,51 @@ via_ir = true
 evm_version = "cancun"
 ffi = true
 gas_limit = "3000000000"
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+    "infinity-core/=lib/infinity-core/",
+    "infinity-periphery/=lib/infinity-periphery/",
+    "openzeppelin-contracts/=lib/infinity-core/lib/openzeppelin-contracts/",
+    "solmate/=lib/infinity-core/lib/solmate/",
+    "permit2/=lib/infinity-periphery/lib/permit2/",
+    "prb-math/=lib/prb-math/src/",
+    "pancake-create3-factory/=lib/pancake-create3-factory/",
+    "lib/infinity-periphery/:infinity-core/=lib/infinity-core/",
+]
 fs_permissions = [
     { access = "read-write", path = ".forge-snapshots/" },
     { access = "read", path = "./script/config" },
     { access = "read", path = "./test/pool-cl/dynamic-fee/test" },
 ]
 
+# The Shared Inventory Hook tests target infinity-core 7c1090e; they run under [profile.bsc] below.
+no_match_path = "test/pool-cl/CLSharedInventoryHook*"
+
 [profile.default.fuzz]
 runs = 256
 
 [profile.ci.fuzz]
 runs = 1000
+
+# The Shared Inventory Hook as deployed on BSC runs on infinity-core 7c1090e
+# (before AppDeficit), not on the 3c5ef1b the rest of this repo builds against.
+# Its tests run here: FOUNDRY_PROFILE=bsc forge test --isolate
+[profile.bsc]
+src = "src/pool-cl/shared-inventory"
+test = "test/pool-cl"
+match_path = "test/pool-cl/CLSharedInventoryHook*"
+no_match_path = "none"
+script = "src/pool-cl/shared-inventory"
+out = "out-bsc"
+cache_path = "cache-bsc"
+auto_detect_remappings = false
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+    "infinity-core/=lib/infinity-core-bsc/",
+    "infinity-periphery/=lib/infinity-periphery/",
+    "openzeppelin-contracts/=lib/infinity-core-bsc/lib/openzeppelin-contracts/",
+    "solmate/=lib/infinity-core-bsc/lib/solmate/",
+    "permit2/=lib/infinity-periphery/lib/permit2/",
+    "@openzeppelin/=lib/infinity-core-bsc/lib/openzeppelin-contracts/",
+    "lib/infinity-periphery/:infinity-core/=lib/infinity-core-bsc/",
+]
